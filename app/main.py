@@ -11,6 +11,9 @@ DB_PATH = "database.db"
 # Global lock to serialize database writes during asyncio.gather
 db_write_lock = asyncio.Lock()
 
+# Standard A2A Content-Type Header
+A2A_HEADERS = {"Content-Type": "application/a2a+json"}
+
 # -----------------------------------------------------------------------------
 # Database Setup & Lifespan / Dependency
 # -----------------------------------------------------------------------------
@@ -61,8 +64,8 @@ async def get_agent_card():
         "description": "An A2A-compliant agent processing tasks and messages.",
         "version": "1.0.0",
         "url": "http://localhost:8000",
-        "defaultInputModes": ["text/plain", "application/json"],
-        "defaultOutputModes": ["text/plain", "application/json"],
+        "defaultInputModes": ["text/plain", "application/json", "application/a2a+json"],
+        "defaultOutputModes": ["text/plain", "application/json", "application/a2a+json"],
         "capabilities": {
             "streaming": False,
             "pushNotifications": False,
@@ -77,7 +80,12 @@ async def get_agent_card():
             }
         ]
     }
-    return JSONResponse(content=card_payload, status_code=200)
+    # Return as standard json or a2a+json for discovery
+    return JSONResponse(
+        content=card_payload,
+        status_code=200,
+        headers={"Content-Type": "application/json"}
+    )
 
 # -----------------------------------------------------------------------------
 # Core Processing Helpers
@@ -126,7 +134,11 @@ async def send_message(
     ) as cursor:
         row = await cursor.fetchone()
         if row and row[0]:
-            return JSONResponse(content=json.loads(row[0]), status_code=200)
+            return JSONResponse(
+                content=json.loads(row[0]),
+                status_code=200,
+                headers=A2A_HEADERS
+            )
 
     # 2. Process Packages / Tasks safely with gather
     packages = body.get("packages", body.get("params", {}).get("packages", []))
@@ -158,4 +170,9 @@ async def send_message(
         except sqlite3.IntegrityError:
             pass
 
-    return JSONResponse(content=response_payload, status_code=200)
+    # Return HTTP 200 with mandatory Content-Type: application/a2a+json
+    return JSONResponse(
+        content=response_payload,
+        status_code=200,
+        headers=A2A_HEADERS
+    )
