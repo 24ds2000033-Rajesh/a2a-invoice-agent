@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: a2a-invoice-agent
+    env: docker
+    plan: free
+    region: singapore
+    envVars:
+      - key: DATABASE_PATH
+        value: /tmp/agent.db
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
