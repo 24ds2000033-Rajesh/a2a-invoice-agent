@@ -18,13 +18,11 @@ db_write_lock = asyncio.Lock()
 async def get_db():
     """Dependency that provides an aiosqlite connection configured for concurrency."""
     async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
-        # Enable Write-Ahead Logging (WAL) and set a 30-second busy timeout
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA busy_timeout=30000;")
         yield db
 
 app = FastAPI(title="A2A Agent Endpoint")
-
 
 @app.on_event("startup")
 async def on_startup():
@@ -33,7 +31,6 @@ async def on_startup():
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA busy_timeout=30000;")
         
-        # Ensure Idempotency table exists with primary/unique constraint
         await db.execute("""
             CREATE TABLE IF NOT EXISTS idempotency (
                 principal TEXT NOT NULL,
@@ -43,7 +40,6 @@ async def on_startup():
                 PRIMARY KEY (principal, message_id)
             );
         """)
-        # Example table setup for packages/tasks processing
         await db.execute("""
             CREATE TABLE IF NOT EXISTS packages (
                 id TEXT PRIMARY KEY,
@@ -54,18 +50,42 @@ async def on_startup():
         await db.commit()
 
 # -----------------------------------------------------------------------------
+# A2A Agent Card Route
+# -----------------------------------------------------------------------------
+
+@app.get("/.well-known/agent-card.json")
+async def get_agent_card():
+    """Serves the mandatory A2A Agent Card manifest."""
+    card_payload = {
+        "name": "My A2A Agent",
+        "description": "An A2A-compliant agent processing tasks and messages.",
+        "version": "1.0.0",
+        "url": "http://localhost:8000",
+        "defaultInputModes": ["text/plain", "application/json"],
+        "defaultOutputModes": ["text/plain", "application/json"],
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "stateTransitionHistory": False
+        },
+        "skills": [
+            {
+                "id": "task_processor",
+                "name": "Task Processor",
+                "description": "Processes messages and packages.",
+                "tags": ["task-processing"]
+            }
+        ]
+    }
+    return JSONResponse(content=card_payload, status_code=200)
+
+# -----------------------------------------------------------------------------
 # Core Processing Helpers
 # -----------------------------------------------------------------------------
 
 async def process_single_package(pkg: Dict[str, Any], db: aiosqlite.Connection) -> Dict[str, Any]:
-    """
-    Processes an individual package safely under a database write lock
-    to prevent 'database is locked' errors during concurrent gather execution.
-    """
-    # 1. Non-DB Async operations (e.g. LLM calls, logic processing) can happen here...
     result = {"pkg_id": pkg.get("id"), "status": "processed"}
 
-    # 2. Acquire write lock when writing back to SQLite
     async with db_write_lock:
         await db.execute(
             """
@@ -93,49 +113,38 @@ async def send_message(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    # Extract A2A protocol parameters (adapt key names to your exact schema)
     principal = request.headers.get("x-principal-id", "default_principal")
     message_id = body.get("messageId") or body.get("id") or body.get("params", {}).get("message", {}).get("messageId")
 
-    # Fallback default if message_id is absent
     if not message_id:
         message_id = f"generated_msg_{hash(str(body))}"
 
-    # -------------------------------------------------------------------------
     # 1. Idempotency Check
-    # -------------------------------------------------------------------------
     async with db.execute(
         "SELECT response FROM idempotency WHERE principal = ? AND message_id = ?",
         (principal, message_id)
     ) as cursor:
         row = await cursor.fetchone()
         if row and row[0]:
-            # Return cached response instantly for duplicate/idempotent requests
             return JSONResponse(content=json.loads(row[0]), status_code=200)
 
-    # -------------------------------------------------------------------------
     # 2. Process Packages / Tasks safely with gather
-    # -------------------------------------------------------------------------
     packages = body.get("packages", body.get("params", {}).get("packages", []))
     
     proposals = []
     if packages:
-        # Uses process_single_package which is protected by db_write_lock
         proposals = await asyncio.gather(
             *[process_single_package(pkg, db) for pkg in packages],
             return_exceptions=False
         )
 
-    # Build response payload according to your A2A protocol spec
     response_payload = {
         "status": "success",
         "messageId": message_id,
         "proposals": proposals
     }
 
-    # -------------------------------------------------------------------------
     # 3. Store Idempotency Key (INSERT OR IGNORE to prevent UNIQUE constraint error)
-    # -------------------------------------------------------------------------
     async with db_write_lock:
         try:
             await db.execute(
@@ -147,7 +156,6 @@ async def send_message(
             )
             await db.commit()
         except sqlite3.IntegrityError:
-            # Safe failover if another concurrent task inserted the key during processing
             pass
 
     return JSONResponse(content=response_payload, status_code=200)
