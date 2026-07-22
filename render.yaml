@@ -7,7 +7,7 @@ services:
     envVars:
       - key: DATABASE_PATH
         value: /tmp/agent.db
-      - key: OPENAI_API_KEY
+      - key: AIPIPE_TOKEN
         sync: false
-      - key: OPENAI_MODEL
+      - key: AI_MODEL
         value: gpt-4o-mini
