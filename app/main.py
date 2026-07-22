@@ -2,25 +2,47 @@ import os
 import json
 import uuid
 import hashlib
+import asyncio
 import aiosqlite
-from typing import Dict, Any
+from typing import Dict, Any, List
 from fastapi import FastAPI, Request, Response, Header, HTTPException, Depends
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.models import (
     A2A_MEDIA_TYPE, INVOICE_BATCH_TYPE, PROPOSALS_TYPE,
-    RESULTS_TYPE, RECEIPTS_TYPE, Task, Message, Part
+    RESULTS_TYPE, RECEIPTS_TYPE
 )
 from app.database import init_db, DB_PATH
 from app.reasoning import hash_package_canonical, analyze_invoice_package
 
 app = FastAPI(title="A2A Invoice Action Agent")
 
+# --- Custom Exception Handlers for A2A Media Type Compliance ---
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail},
+        headers={"Content-Type": A2A_MEDIA_TYPE, "A2A-Version": "1.0"}
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=400,
+        content={"error": "Bad Request", "details": exc.errors()},
+        headers={"Content-Type": A2A_MEDIA_TYPE, "A2A-Version": "1.0"}
+    )
+
 @app.on_event("startup")
 async def startup():
     await init_db()
 
 # --- Helpers ---
+
 def get_bearer_token(authorization: str = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid Bearer token")
@@ -41,7 +63,34 @@ def make_a2a_response(content: Any, status_code: int = 200) -> JSONResponse:
         headers={"Content-Type": A2A_MEDIA_TYPE, "A2A-Version": "1.0"}
     )
 
-# --- Routes ---
+async def process_single_package(pkg: Dict[str, Any], db: aiosqlite.Connection) -> Dict[str, Any]:
+    pkg_id = pkg.get("packageId")
+    pkg_hash = hash_package_canonical(pkg)
+
+    # Check cache first
+    async with db.execute("SELECT decision_json FROM package_cache WHERE package_hash = ?", (pkg_hash,)) as cursor:
+        c_row = await cursor.fetchone()
+
+    if c_row:
+        decision = json.loads(c_row[0])
+    else:
+        decision = await analyze_invoice_package(pkg)
+        await db.execute(
+            "INSERT OR IGNORE INTO package_cache (package_hash, decision_json) VALUES (?, ?)",
+            (pkg_hash, json.dumps(decision))
+        )
+
+    action_id = f"act_{uuid.uuid4().hex[:12]}"
+    return {
+        "packageId": pkg_id,
+        "actionId": action_id,
+        "action": decision["action"],
+        "facts": decision["facts"],
+        "evidenceRefs": decision["evidenceRefs"],
+        "rationale": decision["rationale"]
+    }
+
+# --- Protocol Endpoints ---
 
 @app.get("/.well-known/agent-card.json")
 async def agent_card(request: Request):
@@ -75,7 +124,10 @@ async def agent_card(request: Request):
         "defaultInputModes": [INVOICE_BATCH_TYPE],
         "defaultOutputModes": [PROPOSALS_TYPE, RECEIPTS_TYPE]
     }
-    return JSONResponse(content=card, headers={"Content-Type": A2A_MEDIA_TYPE})
+    return JSONResponse(
+        content=card, 
+        headers={"Content-Type": A2A_MEDIA_TYPE, "A2A-Version": "1.0"}
+    )
 
 @app.post("/message:send")
 async def send_message(
@@ -93,22 +145,24 @@ async def send_message(
     
     async with aiosqlite.connect(DB_PATH) as db:
         # Check Idempotency
-        cursor = await db.execute(
+        async with db.execute(
             "SELECT task_id FROM idempotency WHERE principal = ? AND message_hash = ?",
             (token, msg_hash)
-        )
-        row = await cursor.fetchone()
+        ) as cursor:
+            row = await cursor.fetchone()
+
         if row:
             # Replay stored task
-            t_cursor = await db.execute("SELECT id, context_id, status, history_json, artifacts_json FROM tasks WHERE id = ?", (row[0],))
-            t_row = await t_cursor.fetchone()
-            task_obj = {
-                "id": t_row[0], "contextId": t_row[1], "status": t_row[2],
-                "history": json.loads(t_row[3]), "artifacts": json.loads(t_row[4])
-            }
-            return make_a2a_response({"task": task_obj})
+            async with db.execute("SELECT id, context_id, status, history_json, artifacts_json FROM tasks WHERE id = ?", (row[0],)) as t_cursor:
+                t_row = await t_cursor.fetchone()
 
-        # Process standard input batch
+            if t_row:
+                task_obj = {
+                    "id": t_row[0], "contextId": t_row[1], "status": t_row[2],
+                    "history": json.loads(t_row[3]), "artifacts": json.loads(t_row[4])
+                }
+                return make_a2a_response({"task": task_obj})
+
         parts = msg_data.get("parts", [])
         if not parts:
             raise HTTPException(status_code=400, detail="No parts in message")
@@ -125,39 +179,14 @@ async def send_message(
             task_id = f"task_{uuid.uuid4().hex[:16]}"
             context_id = f"ctx_{uuid.uuid4().hex[:16]}"
             
-            proposals = []
-            for pkg in packages:
-                pkg_id = pkg.get("packageId")
-                pkg_hash = hash_package_canonical(pkg)
-
-                # Check decision cache
-                c_cursor = await db.execute("SELECT decision_json FROM package_cache WHERE package_hash = ?", (pkg_hash,))
-                c_row = await c_cursor.fetchone()
-                
-                if c_row:
-                    decision = json.loads(c_row[0])
-                else:
-                    decision = await analyze_invoice_package(pkg)
-                    await db.execute(
-                        "INSERT OR IGNORE INTO package_cache (package_hash, decision_json) VALUES (?, ?)",
-                        (pkg_hash, json.dumps(decision))
-                    )
-
-                action_id = f"act_{uuid.uuid4().hex[:12]}"
-                proposals.append({
-                    "packageId": pkg_id,
-                    "actionId": action_id,
-                    "action": decision["action"],
-                    "facts": decision["facts"],
-                    "evidenceRefs": decision["evidenceRefs"],
-                    "rationale": decision["rationale"]
-                })
+            # Process packages concurrently to stay well within timeout limits
+            proposals = await asyncio.gather(*[process_single_package(pkg, db) for pkg in packages])
 
             proposal_artifact = {
                 "mediaType": PROPOSALS_TYPE,
                 "data": {
                     "batchId": batch_id,
-                    "proposals": proposals
+                    "proposals": list(proposals)
                 }
             }
 
@@ -169,7 +198,6 @@ async def send_message(
                 "artifacts": [proposal_artifact]
             }
 
-            # Persist Task & Idempotency atomically
             await db.execute(
                 "INSERT INTO tasks (id, principal, context_id, status, history_json, artifacts_json) VALUES (?, ?, ?, ?, ?, ?)",
                 (task_id, token, context_id, task_obj["status"], json.dumps(task_obj["history"]), json.dumps(task_obj["artifacts"]))
@@ -186,24 +214,23 @@ async def send_message(
             target_task_id = msg_data.get("taskId")
             target_ctx_id = msg_data.get("contextId")
 
-            t_cursor = await db.execute("SELECT id, principal, context_id, status, history_json, artifacts_json FROM tasks WHERE id = ?", (target_task_id,))
-            t_row = await t_cursor.fetchone()
+            async with db.execute("SELECT id, principal, context_id, status, history_json, artifacts_json FROM tasks WHERE id = ?", (target_task_id,)) as t_cursor:
+                t_row = await t_cursor.fetchone()
             
             if not t_row or t_row[1] != token:
                 raise HTTPException(status_code=404, detail="Task not found or access denied")
 
-            curr_status = t_row[2]
+            curr_status = t_row[3]
             if curr_status in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
                 raise HTTPException(status_code=409, detail="Task is in terminal state")
 
-            stored_ctx_id = t_row[1]
+            stored_ctx_id = t_row[2]
             if target_ctx_id and target_ctx_id != stored_ctx_id:
                 raise HTTPException(status_code=400, detail="Context ID mismatch")
 
-            history = json.loads(t_row[3])
-            artifacts = json.loads(t_row[4])
+            history = json.loads(t_row[4])
+            artifacts = json.loads(t_row[5])
 
-            # Find stored proposals
             proposals_artifact = next((a for a in artifacts if a.get("mediaType") == PROPOSALS_TYPE), None)
             if not proposals_artifact:
                 raise HTTPException(status_code=400, detail="No stored proposals found for continuation")
@@ -218,7 +245,6 @@ async def send_message(
                 pkg_id = res.get("packageId")
                 matched_prop = proposal_map.get(pkg_id)
                 
-                # Match validation
                 if not matched_prop or matched_prop["actionId"] != res.get("actionId") or matched_prop["action"] != res.get("action"):
                     raise HTTPException(status_code=400, detail="Continuation result does not match stored proposal")
 
@@ -270,8 +296,9 @@ async def get_task(
     _ver: None = Depends(check_version)
 ):
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id, principal, context_id, status, history_json, artifacts_json FROM tasks WHERE id = ?", (task_id,))
-        row = await cursor.fetchone()
+        async with db.execute("SELECT id, principal, context_id, status, history_json, artifacts_json FROM tasks WHERE id = ?", (task_id,)) as cursor:
+            row = await cursor.fetchone()
+
         if not row or row[1] != token:
             raise HTTPException(status_code=404, detail="Task not found")
 
@@ -287,8 +314,9 @@ async def list_tasks(
     _ver: None = Depends(check_version)
 ):
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id, context_id, status, history_json, artifacts_json FROM tasks WHERE principal = ?", (token,))
-        rows = await cursor.fetchall()
+        async with db.execute("SELECT id, context_id, status, history_json, artifacts_json FROM tasks WHERE principal = ?", (token,)) as cursor:
+            rows = await cursor.fetchall()
+
         tasks = [
             {
                 "id": r[0], "contextId": r[1], "status": r[2],
@@ -305,8 +333,9 @@ async def cancel_task(
     _ver: None = Depends(check_version)
 ):
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id, principal, context_id, status, history_json, artifacts_json FROM tasks WHERE id = ?", (task_id,))
-        row = await cursor.fetchone()
+        async with db.execute("SELECT id, principal, context_id, status, history_json, artifacts_json FROM tasks WHERE id = ?", (task_id,)) as cursor:
+            row = await cursor.fetchone()
+
         if not row or row[1] != token:
             raise HTTPException(status_code=404, detail="Task not found")
 
