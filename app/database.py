@@ -1,7 +1,5 @@
 import os
-import sqlite3
 import aiosqlite
-import json
 
 DB_PATH = os.getenv("DATABASE_PATH", "/tmp/agent.db")
 
@@ -9,7 +7,6 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
         
-        # Tasks Table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -23,17 +20,16 @@ async def init_db():
             );
         """)
         
-        # Idempotency Table: (principal, message_hash) -> task_id
         await db.execute("""
             CREATE TABLE IF NOT EXISTS idempotency (
                 principal TEXT NOT NULL,
+                message_id TEXT NOT NULL,
                 message_hash TEXT NOT NULL,
                 task_id TEXT NOT NULL,
-                PRIMARY KEY (principal, message_hash)
+                PRIMARY KEY (principal, message_id)
             );
         """)
 
-        # Package Decision Cache: Canonical Package Hash -> Decision JSON
         await db.execute("""
             CREATE TABLE IF NOT EXISTS package_cache (
                 package_hash TEXT PRIMARY KEY,
@@ -42,7 +38,3 @@ async def init_db():
         """)
         
         await db.commit()
-
-async def get_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        yield db
